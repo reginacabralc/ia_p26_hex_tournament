@@ -96,4 +96,57 @@ En Dark Hex el tablero del oponente es parcialmente invisible. La estrategia usa
 - **V1–V3**: MCTS básico, sin RAVE, sin paralelismo.
 - **V4**: Se añadió RAVE y tabla de transposición.
 - **V5**: Fix de apertura, tiempo dinámico, FPU bidireccional, tree reuse.
-- **V6 (actual)**: Root parallelization (4 cores), soft eval con sigmoide continua en lugar de evaluación binaria.
+- **V6**: Root parallelization (4 cores), soft eval con sigmoide continua.
+- **V7**: Save-bridge + break-bridge en rollouts.
+- **V8 / strategy_v2.py (candidato)**: Ver sección siguiente.
+
+---
+
+## V8 — strategy_v2.py
+
+### Bugs corregidos respecto a V7
+
+| Bug | Ubicación V7 | Corrección |
+|---|---|---|
+| Transposition table double-counting | `_mcts_expand` / `_mcts_backpropagate` | Priors sólo se inyectan cuando `child.visits == 0`; tabla sólo se escribe al primer visit real |
+| Tree reuse sin validación de hash | `_descend_root` | Se guarda el hash del tablero en cada turno y se valida antes de reutilizar |
+| Dark mode `estimated_hidden` incorrecto | `_determinize` | Fórmula corregida: `(my_count + collision_count) - known_count - (1 if player==1 else 0)` |
+
+### Nuevas funcionalidades
+
+#### A. Hard time safety
+- **Fallback precomputado**: al inicio de `play()` se calcula un movimiento greedy (celda en el camino Dijkstra mínimo) como respaldo.
+- **Worker join con cap dinámico**: `async_result.get(timeout=max(0.05, deadline - now - 0.05))`.
+- **Deadline dentro del rollout**: `_fast_rollout` recibe `deadline` y aborta la simulación si se acerca.
+- **Budget shaping**: 55% en los primeros 3 movimientos, 93% en midgame, con margen duro de 20%.
+
+#### B. Rollouts más fuertes
+- **Plantillas de borde 4-3-2**: cuando el oponente amenaza el borde, se aplica respuesta determinista antes del muestreo aleatorio.
+- **Ladder-avoidance**: bump de 5% de probabilidad para respuesta perpendicular cuando los dos últimos movimientos del oponente son colineales.
+
+#### C. Candidatos: dead-cell + radio adaptativo + progressive widening
+- **Filtro dead-cell**: celdas donde todos los vecinos son del oponente o fuera del tablero se eliminan del conjunto candidato.
+- **Progressive widening en raíz**: se inicia con `K₀=8` candidatos (los mejores por FPU); se desbloquea uno nuevo cada `⌈3√N⌉` iteraciones.
+
+#### D. Evaluación mejorada
+- **Dijkstra bridge-aware**: vacíos que forman puentes virtuales entre dos piezas propias tienen costo 0 en lugar de 1.
+- **Parámetros reajustados**: `UCT_C=1.1, RAVE_K=300, RAVE_BLEND=0.75, CUTOFF_FILL=0.62`.
+
+#### E. Dark mode: ISMCTS-lite
+- Se generan **4 determinizaciones** al inicio de `play()`.
+- Main thread y 3 workers usan determinizaciones distintas (ISMCTS-lite sin merge de árbol).
+- Prior mejorado: mezcla 60% peso-centro + 40% peso-eje del oponente.
+
+#### F. Opening book (11x11)
+- Primera jugada como Negro: `(1, 9)` (esquina superior-derecha fuerte).
+- Respuestas como Blanco a los 5 movimientos de apertura más comunes del oponente.
+
+### Parámetros clave V8
+
+```
+UCT_C=1.1  RAVE_K=300  RAVE_BLEND=0.75
+TIME_BUDGET=0.93  CUTOFF_FILL=0.62  SAFETY_TAIL=0.20
+NEIGHBOR_P=0.72  DIRECTION_P=0.22  DIRECTION_K=6
+EXPAND_RADIUS=2  TRANS_CAP=32  NUM_WORKERS=3
+NUM_DETERMINIZATIONS=4  PROG_WIDENING_K0=8
+```
