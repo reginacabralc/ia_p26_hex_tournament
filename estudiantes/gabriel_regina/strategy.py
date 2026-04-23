@@ -2,11 +2,11 @@
 Estrategia MCTS + RAVE para Hex 11x11.
 Autores: <gabriel_regina>
 
-Version 6:
-  Root parallelization: 3 procesos MCTS independientes + 1 principal = 4 cores.
-  Soft eval: sigmoid continuo de diferencia de distancias Dijkstra (mejor señal).
-  Mantiene: Fix 1-5 de V5 (sin atajo apertura, tabla transposicion, tiempo
-            dinamico, bias direccional, FPU bidireccional, tree reuse).
+Version 7:
+  Save-bridge pattern: si el oponente juega en una carrier de nuestro bridge,
+  respondemos en la otra carrier preservando la conexion (patron fundamental
+  de Hex — reduce varianza en partidas cerradas).
+  Mantiene: V6 (root parallelization + soft eval) y todos los fixes V5.
 """
 
 from __future__ import annotations
@@ -40,6 +40,30 @@ DIRECTION_K   = 5
 EXPAND_RADIUS = 2
 TRANS_CAP     = 50
 NUM_WORKERS   = 3   # workers adicionales; total = NUM_WORKERS + 1 main
+
+# Save-bridge: 6 patrones de bridge centrados en `last` (celda del oponente).
+# (A_offset, B_offset, save_offset) relativo a `last`.
+# Si A y B son nuestras piedras y `save` esta vacia → save preserva el bridge.
+BRIDGE_PATTERNS = (
+    ((-1, 0),  (0, 1),   (-1, 1)),
+    ((-1, 0),  (1, -1),  (0, -1)),
+    ((-1, 1),  (1, 0),   (0, 1)),
+    ((-1, 1),  (0, -1),  (-1, 0)),
+    ((0, -1),  (1, 0),   (1, -1)),
+    ((0, 1),   (1, -1),  (1, 0)),
+)
+
+# Break-bridge: desde `last` como un extremo del bridge del oponente.
+# (B_offset, c1_offset, c2_offset) relativo a `last` (extremo A).
+# Si B es del oponente y c1, c2 estan vacias → jugar c1 rompe el bridge.
+BRIDGE_ENDPOINTS = (
+    ((-2, 1),  (-1, 0),  (-1, 1)),
+    ((-1, 2),  (-1, 1),  (0, 1)),
+    ((1, 1),   (0, 1),   (1, 0)),
+    ((2, -1),  (1, 0),   (1, -1)),
+    ((1, -2),  (1, -1),  (0, -1)),
+    ((-1, -1), (0, -1),  (-1, 0)),
+)
 
 
 # ---------------------------------------------------------------------------
@@ -242,7 +266,56 @@ def _fpu_order(board, size, candidates, player):
 
 
 # ---------------------------------------------------------------------------
-# Rollout rapido con bias direccional
+# Save-bridge: detectar si `last` rompio uno de nuestros bridges
+# ---------------------------------------------------------------------------
+
+def _check_save_bridge(b, size, last, current):
+    """Si `last` es carrier de un bridge de `current`, retorna la otra carrier."""
+    lr, lc = last
+    for (dar, dac), (dbr, dbc), (dsr, dsc) in BRIDGE_PATTERNS:
+        ar, ac = lr + dar, lc + dac
+        if not (0 <= ar < size and 0 <= ac < size):
+            continue
+        if b[ar][ac] != current:
+            continue
+        br, bc = lr + dbr, lc + dbc
+        if not (0 <= br < size and 0 <= bc < size):
+            continue
+        if b[br][bc] != current:
+            continue
+        sr, sc = lr + dsr, lc + dsc
+        if not (0 <= sr < size and 0 <= sc < size):
+            continue
+        if b[sr][sc] != 0:
+            continue
+        return (sr, sc)
+    return None
+
+
+def _check_break_bridge(b, size, last, current):
+    """Si `last` (piedra del oponente) forma un bridge con otra piedra suya, retorna
+    una carrier para romperlo. `last` se trata como extremo A del bridge."""
+    opp = 3 - current
+    lr, lc = last
+    for (dbr, dbc), (dc1r, dc1c), (dc2r, dc2c) in BRIDGE_ENDPOINTS:
+        br, bc = lr + dbr, lc + dbc
+        if not (0 <= br < size and 0 <= bc < size):
+            continue
+        if b[br][bc] != opp:
+            continue
+        c1r, c1c = lr + dc1r, lc + dc1c
+        if not (0 <= c1r < size and 0 <= c1c < size):
+            continue
+        c2r, c2c = lr + dc2r, lc + dc2c
+        if not (0 <= c2r < size and 0 <= c2c < size):
+            continue
+        if b[c1r][c1c] == 0 and b[c2r][c2c] == 0:
+            return (c1r, c1c)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Rollout rapido con save-bridge + bias direccional
 # ---------------------------------------------------------------------------
 
 def _fast_rollout(b, size, player_to_move, root_player, pool, filled):
@@ -259,7 +332,19 @@ def _fast_rollout(b, size, player_to_move, root_player, pool, filled):
     while filled < cutoff and len(pool) > 0:
         chosen = None
 
-        if last is not None and random.random() < NEIGHBOR_P:
+        # Prioridad 0: save-bridge (salvar nuestra conexion)
+        if last is not None:
+            save = _check_save_bridge(b, size, last, current)
+            if save is not None:
+                chosen = save
+
+        # Prioridad 1: break-bridge (atacar conexion del oponente)
+        if chosen is None and last is not None:
+            brk = _check_break_bridge(b, size, last, current)
+            if brk is not None:
+                chosen = brk
+
+        if chosen is None and last is not None and random.random() < NEIGHBOR_P:
             r, c = last
             nbrs = [(nr, nc) for nr, nc in get_neighbors(r, c, size)
                     if b[nr][nc] == 0]
