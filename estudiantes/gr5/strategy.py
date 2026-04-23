@@ -939,6 +939,7 @@ class MiEstrategiaGR5(Strategy):
         if success:
             self._my_moves.add(move)
             self._dark_risk.pop(move, None)
+            self._hidden_opp.discard(move)
         else:
             self._failed_moves.add(move)
             self._hidden_opp.add(move)
