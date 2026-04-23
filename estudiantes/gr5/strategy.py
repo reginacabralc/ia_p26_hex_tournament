@@ -7,17 +7,12 @@ from __future__ import annotations
 import heapq
 import math
 import multiprocessing as mp
+import os
 import random
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 
 from strategy import Strategy, GameConfig
-from hex_game import (
-    get_neighbors,
-    check_winner,
-    shortest_path_distance,
-    empty_cells,
-)
 
 # ---------------------------------------------------------------------------
 # Constantes
@@ -34,7 +29,13 @@ EXPAND_RADIUS = 2
 TRANS_CAP     = 50
 NUM_WORKERS   = 3   # workers adicionales; total = NUM_WORKERS + 1 main
 OPENING_BOOK  = True
-SAFETY_TAIL   = 0.20
+SAFETY_TAIL_CLASSIC = 0.20
+SAFETY_TAIL_DARK    = 0.45
+CLASSIC_WORKER_MARGIN = 0.15
+DARK_WORKER_MARGIN    = 0.45
+DARK_MIN_SEARCH_WINDOW = 0.90
+DARK_PREP_FRACTION     = 0.10
+DARK_PREP_CAP          = 0.30
 NUM_DETERMINIZATIONS = 4
 
 # Save-bridge: 6 patrones de bridge centrados en `last` (celda del oponente).
@@ -83,6 +84,106 @@ _OPENING_BOOK: dict[tuple, tuple[int, int]] = {
     ((3, 7),): (5, 5),
     ((7, 3),): (5, 5),
 }
+
+_DARK_WHITE_OPENING = (
+    (6, 2),
+    (4, 7),
+    (7, 2),
+    (3, 7),
+    (2, 8),
+    (5, 6),
+)
+
+_DARK_BLACK_OPENING = (
+    (2, 6),
+    (5, 6),
+    (7, 3),
+    (6, 3),
+    (2, 7),
+    (8, 4),
+)
+
+_DARK_BLACK_REPLY = {
+    (2, 6): ((1, 6), (4, 5), (3, 7), (0, 7)),
+    (5, 6): ((7, 5), (3, 7), (5, 5), (4, 7)),
+    (7, 3): ((9, 2), (5, 4), (7, 4), (8, 2)),
+    (6, 3): ((8, 2), (4, 4), (6, 4), (5, 4)),
+}
+
+_PRECOMP: dict[int, tuple[tuple[tuple[tuple[int, int], ...], ...], tuple[tuple[int, int], ...],
+                         tuple[tuple[int, int], ...], tuple[tuple[int, int], ...],
+                         tuple[tuple[int, int], ...]]] = {}
+
+
+def _env_int(name, default, lo=None, hi=None):
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    if lo is not None and value < lo:
+        value = lo
+    if hi is not None and value > hi:
+        value = hi
+    return value
+
+
+def _precomp(size):
+    cached = _PRECOMP.get(size)
+    if cached is not None:
+        return cached
+
+    neighbors = []
+    top = []
+    bottom = []
+    left = []
+    right = []
+    for r in range(size):
+        for c in range(size):
+            if r == 0:
+                top.append((r, c))
+            if r == size - 1:
+                bottom.append((r, c))
+            if c == 0:
+                left.append((r, c))
+            if c == size - 1:
+                right.append((r, c))
+
+            cell_neighbors = []
+            if r > 0:
+                cell_neighbors.append((r - 1, c))
+                if c + 1 < size:
+                    cell_neighbors.append((r - 1, c + 1))
+            if c > 0:
+                cell_neighbors.append((r, c - 1))
+            if c + 1 < size:
+                cell_neighbors.append((r, c + 1))
+            if r + 1 < size:
+                if c > 0:
+                    cell_neighbors.append((r + 1, c - 1))
+                cell_neighbors.append((r + 1, c))
+            neighbors.append(tuple(cell_neighbors))
+
+    cached = (
+        tuple(neighbors),
+        tuple(top),
+        tuple(bottom),
+        tuple(left),
+        tuple(right),
+    )
+    _PRECOMP[size] = cached
+    return cached
+
+
+def _cell_index(size, r, c):
+    return r * size + c
+
+
+def _neighbors_of(size, r, c):
+    neighbors, _, _, _, _ = _precomp(size)
+    return neighbors[_cell_index(size, r, c)]
 
 
 # ---------------------------------------------------------------------------
@@ -163,14 +264,143 @@ def _board_to_lists(board):
     return [list(row) for row in board]
 
 
+def _collect_empty_cells(board, size):
+    empties = []
+    append = empties.append
+    for r in range(size):
+        row = board[r]
+        for c in range(size):
+            if row[c] == 0:
+                append((r, c))
+    return empties
+
+
 def _board_hash(board):
+    if isinstance(board, tuple) and board and isinstance(board[0], tuple):
+        return hash(board)
     return hash(tuple(tuple(row) for row in board))
+
+
+def _bfs_connected(board, size, player):
+    neighbors, top, _, left, _ = _precomp(size)
+    visited = [False] * (size * size)
+    queue = deque()
+
+    if player == 1:
+        goal_row = size - 1
+        for r, c in top:
+            if board[r][c] == 1:
+                idx = _cell_index(size, r, c)
+                visited[idx] = True
+                queue.append((r, c))
+        while queue:
+            r, c = queue.popleft()
+            if r == goal_row:
+                return True
+            for nr, nc in neighbors[_cell_index(size, r, c)]:
+                nidx = _cell_index(size, nr, nc)
+                if not visited[nidx] and board[nr][nc] == 1:
+                    visited[nidx] = True
+                    queue.append((nr, nc))
+        return False
+
+    goal_col = size - 1
+    for r, c in left:
+        if board[r][c] == 2:
+            idx = _cell_index(size, r, c)
+            visited[idx] = True
+            queue.append((r, c))
+    while queue:
+        r, c = queue.popleft()
+        if c == goal_col:
+            return True
+        for nr, nc in neighbors[_cell_index(size, r, c)]:
+            nidx = _cell_index(size, nr, nc)
+            if not visited[nidx] and board[nr][nc] == 2:
+                visited[nidx] = True
+                queue.append((nr, nc))
+    return False
+
+
+def _check_winner(board, size):
+    if _bfs_connected(board, size, 1):
+        return 1
+    if _bfs_connected(board, size, 2):
+        return 2
+    return 0
+
+
+def _shortest_path_distance(board, size, player):
+    INF = size * size + 1
+    dist = [INF] * (size * size)
+    heap = []
+    neighbors, top, _, left, _ = _precomp(size)
+    opp = 3 - player
+
+    if player == 1:
+        goal_row = size - 1
+        for r, c in top:
+            cell = board[r][c]
+            if cell == opp:
+                continue
+            idx = _cell_index(size, r, c)
+            d = 0 if cell == player else 1
+            if d < dist[idx]:
+                dist[idx] = d
+                heapq.heappush(heap, (d, r, c))
+        while heap:
+            d, r, c = heapq.heappop(heap)
+            idx = _cell_index(size, r, c)
+            if d != dist[idx]:
+                continue
+            if r == goal_row:
+                return d
+            for nr, nc in neighbors[idx]:
+                nidx = _cell_index(size, nr, nc)
+                cell = board[nr][nc]
+                if cell == opp:
+                    continue
+                nd = d if cell == player else d + 1
+                if nd < dist[nidx]:
+                    dist[nidx] = nd
+                    heapq.heappush(heap, (nd, nr, nc))
+        return INF
+
+    goal_col = size - 1
+    for r, c in left:
+        cell = board[r][c]
+        if cell == opp:
+            continue
+        idx = _cell_index(size, r, c)
+        d = 0 if cell == player else 1
+        if d < dist[idx]:
+            dist[idx] = d
+            heapq.heappush(heap, (d, r, c))
+
+    while heap:
+        d, r, c = heapq.heappop(heap)
+        idx = _cell_index(size, r, c)
+        if d != dist[idx]:
+            continue
+        if c == goal_col:
+            return d
+        for nr, nc in neighbors[idx]:
+            nidx = _cell_index(size, nr, nc)
+            cell = board[nr][nc]
+            if cell == opp:
+                continue
+            nd = d if cell == player else d + 1
+            if nd < dist[nidx]:
+                dist[nidx] = nd
+                heapq.heappush(heap, (nd, nr, nc))
+
+    return INF
 
 
 def _soft_eval(board, size, root_player, next_to_move):
     """Eval continuo [0,1]: sigmoid de diferencia de distancias + tempo."""
-    my_dist  = shortest_path_distance(board, size, root_player)
-    opp_dist = shortest_path_distance(board, size, 3 - root_player)
+    my_dist  = _shortest_path_distance(board, size, root_player)
+    opp_dist = _shortest_path_distance(board, size, 3 - root_player)
     INF = size * size + 1
     if my_dist >= INF:
         return 0.0
@@ -222,35 +452,37 @@ def _candidates(board, size, empties):
 def _full_dijkstra(board, size, player, from_start):
     INF = float("inf")
     opp = 3 - player
-    dist = {}
+    dist = [INF] * (size * size)
     heap = []
+    neighbors, top, bottom, left, right = _precomp(size)
 
     if player == 1:
-        edge_rc = [(0, c) for c in range(size)] if from_start \
-                  else [(size - 1, c) for c in range(size)]
+        edge_rc = top if from_start else bottom
     else:
-        edge_rc = [(r, 0) for r in range(size)] if from_start \
-                  else [(r, size - 1) for r in range(size)]
+        edge_rc = left if from_start else right
 
     for r, c in edge_rc:
         if board[r][c] == opp:
             continue
+        idx = _cell_index(size, r, c)
         d = 0 if board[r][c] == player else 1
-        if d < dist.get((r, c), INF):
-            dist[(r, c)] = d
+        if d < dist[idx]:
+            dist[idx] = d
             heapq.heappush(heap, (d, r, c))
 
     while heap:
         d, r, c = heapq.heappop(heap)
-        if d > dist.get((r, c), INF):
+        idx = _cell_index(size, r, c)
+        if d != dist[idx]:
             continue
-        for nr, nc in get_neighbors(r, c, size):
+        for nr, nc in neighbors[idx]:
             if board[nr][nc] == opp:
                 continue
+            nidx = _cell_index(size, nr, nc)
             add = 0 if board[nr][nc] == player else 1
             nd = d + add
-            if nd < dist.get((nr, nc), INF):
-                dist[(nr, nc)] = nd
+            if nd < dist[nidx]:
+                dist[nidx] = nd
                 heapq.heappush(heap, (nd, nr, nc))
 
     return dist
@@ -266,9 +498,9 @@ def _fpu_order(board, size, candidates, player):
     bwd = _full_dijkstra(board, size, player, from_start=False)
 
     if player == 1:
-        total = min(fwd.get((size - 1, c), INF) for c in range(size))
+        total = min(fwd[_cell_index(size, size - 1, c)] for c in range(size))
     else:
-        total = min(fwd.get((r, size - 1), INF) for r in range(size))
+        total = min(fwd[_cell_index(size, r, size - 1)] for r in range(size))
 
     if total == INF:
         random.shuffle(candidates)
@@ -276,8 +508,9 @@ def _fpu_order(board, size, candidates, player):
 
     on_path = set()
     for r, c in candidates:
-        f = fwd.get((r, c), INF)
-        b_d = bwd.get((r, c), INF)
+        idx = _cell_index(size, r, c)
+        f = fwd[idx]
+        b_d = bwd[idx]
         if f != INF and b_d != INF and f + b_d == total + 1:
             on_path.add((r, c))
 
@@ -296,16 +529,82 @@ def _greedy_fallback(board, size, player, empties):
     fwd = _full_dijkstra(board, size, player, from_start=True)
     bwd = _full_dijkstra(board, size, player, from_start=False)
     if player == 1:
-        total = min(fwd.get((size - 1, c), INF) for c in range(size))
+        total = min(fwd[_cell_index(size, size - 1, c)] for c in range(size))
     else:
-        total = min(fwd.get((r, size - 1), INF) for r in range(size))
+        total = min(fwd[_cell_index(size, r, size - 1)] for r in range(size))
     if total < INF:
         for r, c in empties:
-            f = fwd.get((r, c), INF)
-            b = bwd.get((r, c), INF)
+            idx = _cell_index(size, r, c)
+            f = fwd[idx]
+            b = bwd[idx]
             if f != INF and b != INF and f + b == total + 1:
                 return (r, c)
     return empties[0]
+
+
+def _dark_risk_score(move, size, risk_map, hidden_opp):
+    risk = risk_map.get(move, 0.0)
+    for nr, nc in _neighbors_of(size, move[0], move[1]):
+        if (nr, nc) in hidden_opp:
+            risk += 1.25
+        risk += 0.20 * risk_map.get((nr, nc), 0.0)
+    return risk
+
+
+def _dark_risk_clearance(move, size, risk_map, hidden_opp):
+    return 1.0 / (1.0 + _dark_risk_score(move, size, risk_map, hidden_opp))
+
+
+def _dark_safe_fallback(board, size, player, empties, risk_map, hidden_opp):
+    if not empties:
+        return None
+
+    INF = float("inf")
+    fwd = _full_dijkstra(board, size, player, from_start=True)
+    bwd = _full_dijkstra(board, size, player, from_start=False)
+    if player == 1:
+        total = min(fwd[_cell_index(size, size - 1, c)] for c in range(size))
+    else:
+        total = min(fwd[_cell_index(size, r, size - 1)] for r in range(size))
+
+    shortlist = []
+    if total < INF:
+        for r, c in empties:
+            idx = _cell_index(size, r, c)
+            f = fwd[idx]
+            b = bwd[idx]
+            if f != INF and b != INF and f + b == total + 1:
+                shortlist.append((r, c))
+    if not shortlist:
+        shortlist = empties
+
+    center = size // 2
+    return max(
+        shortlist,
+        key=lambda rc: (
+            _dark_risk_clearance(rc, size, risk_map, hidden_opp),
+            -(abs(rc[0] - center) + abs(rc[1] - center)),
+        ),
+    )
+
+
+def _pick_opening_move(candidates, board, size, risk_map=None, hidden_opp=None):
+    if risk_map is None:
+        risk_map = {}
+    if hidden_opp is None:
+        hidden_opp = set()
+    best_move = None
+    best_score = -1.0
+    for move in candidates:
+        r, c = move
+        if board[r][c] != 0:
+            continue
+        score = _dark_risk_clearance(move, size, risk_map, hidden_opp)
+        # Preserve curated opening order on ties instead of drifting to center.
+        if score > best_score:
+            best_score = score
+            best_move = move
+    return best_move
 
 
 # ---------------------------------------------------------------------------
@@ -391,6 +690,8 @@ def _fast_rollout(b, size, player_to_move, root_player, pool, filled,
     cutoff = int(CUTOFF_FILL * size * size)
     moves_played = []
     last = None
+    rand = random.random
+    randrange = random.randrange
 
     p1_top   = any(b[0][c] == 1 for c in range(size))
     p1_bot   = any(b[size - 1][c] == 1 for c in range(size))
@@ -418,21 +719,37 @@ def _fast_rollout(b, size, player_to_move, root_player, pool, filled,
             if tpl is not None:
                 chosen = tpl
 
-        if chosen is None and last is not None and random.random() < NEIGHBOR_P:
+        if chosen is None and last is not None and rand() < NEIGHBOR_P:
             r, c = last
-            nbrs = [(nr, nc) for nr, nc in get_neighbors(r, c, size)
-                    if b[nr][nc] == 0]
-            if nbrs:
-                chosen = nbrs[random.randrange(len(nbrs))]
+            seen = 0
+            picked = None
+            for nr, nc in _neighbors_of(size, r, c):
+                if b[nr][nc] != 0:
+                    continue
+                seen += 1
+                if seen == 1 or randrange(seen) == 0:
+                    picked = (nr, nc)
+            if picked is not None:
+                chosen = picked
 
         if chosen is None and len(pool) >= DIRECTION_K \
-                and random.random() < DIRECTION_P:
-            samples = [pool.cells[random.randrange(len(pool.cells))]
-                       for _ in range(DIRECTION_K)]
+                and rand() < DIRECTION_P:
+            cells = pool.cells
+            chosen = None
             if current == 1:
-                chosen = max(samples, key=lambda rc: rc[0])
+                best_key = -1
+                for _ in range(DIRECTION_K):
+                    cand = cells[randrange(len(cells))]
+                    if cand[0] > best_key:
+                        best_key = cand[0]
+                        chosen = cand
             else:
-                chosen = max(samples, key=lambda rc: rc[1])
+                best_key = -1
+                for _ in range(DIRECTION_K):
+                    cand = cells[randrange(len(cells))]
+                    if cand[1] > best_key:
+                        best_key = cand[1]
+                        chosen = cand
 
         if chosen is None:
             chosen = pool.random()
@@ -448,14 +765,14 @@ def _fast_rollout(b, size, player_to_move, root_player, pool, filled,
                 p1_top = True
             elif cr == size - 1:
                 p1_bot = True
-            if p1_top and p1_bot and check_winner(b, size) == 1:
+            if p1_top and p1_bot and _check_winner(b, size) == 1:
                 return (1.0 if root_player == 1 else 0.0), moves_played
         else:
             if cc == 0:
                 p2_left = True
             elif cc == size - 1:
                 p2_right = True
-            if p2_left and p2_right and check_winner(b, size) == 2:
+            if p2_left and p2_right and _check_winner(b, size) == 2:
                 return (1.0 if root_player == 2 else 0.0), moves_played
 
         last = chosen
@@ -482,7 +799,7 @@ def _mcts_expand(node, board, size, trans_table=None):
     b = [list(row) for row in board]
     b[move[0]][move[1]] = node.player_to_move
     next_player = 3 - node.player_to_move
-    child_empties = [(r, c) for r in range(size) for c in range(size) if b[r][c] == 0]
+    child_empties = _collect_empty_cells(b, size)
     cands = _candidates(b, size, child_empties)
     random.shuffle(cands)
     child = _Node(move=move, parent=node, untried_moves=cands, player_to_move=next_player)
@@ -540,8 +857,7 @@ def _worker_run(args):
     t0 = time.monotonic()
     deadline = t0 + duration
 
-    empties = [(r, c) for r in range(size) for c in range(size)
-               if board_tuple[r][c] == 0]
+    empties = _collect_empty_cells(board_tuple, size)
     if not empties:
         return {}
 
@@ -578,11 +894,18 @@ class MiEstrategiaGR5(Strategy):
         self._opponent   = config.opponent
         self._time_limit = config.time_limit
         self._variant    = config.variant
+        self._pool_workers = _env_int("GR5_POOL_WORKERS", NUM_WORKERS, 0, NUM_WORKERS)
+        det_default = NUM_DETERMINIZATIONS
+        if os.environ.get("GR5_POOL_WORKERS") is not None \
+                and os.environ.get("GR5_NUM_DETERMINIZATIONS") is None:
+            det_default = max(1, self._pool_workers + 1)
+        self._num_determinizations = _env_int("GR5_NUM_DETERMINIZATIONS", det_default, 1, None)
 
         self._hidden_opp   = set()
         self._my_moves     = set()
         self._failed_moves = set()
         self._collision_count = 0
+        self._dark_risk = defaultdict(float)
 
         self._root         = None
         self._last_my_move = None
@@ -591,26 +914,38 @@ class MiEstrategiaGR5(Strategy):
         self._move_count   = 0
 
         # Terminar pool anterior y crear nuevo con fork
-        old_pool = getattr(self, '_pool', None)
-        if old_pool is not None:
+        self._dispose_pool()
+        if self._pool_workers > 0:
             try:
-                old_pool.terminate()
-                old_pool.join()
+                ctx = mp.get_context('fork')
+                self._pool = ctx.Pool(self._pool_workers)
             except Exception:
-                pass
-        try:
-            ctx = mp.get_context('fork')
-            self._pool = ctx.Pool(NUM_WORKERS)
-        except Exception:
+                self._pool = None
+        else:
             self._pool = None
+
+    def _dispose_pool(self):
+        pool = getattr(self, "_pool", None)
+        if pool is None:
+            return
+        try:
+            pool.terminate()
+            pool.join()
+        except Exception:
+            pass
+        self._pool = None
 
     def on_move_result(self, move, success):
         if success:
             self._my_moves.add(move)
+            self._dark_risk.pop(move, None)
         else:
             self._failed_moves.add(move)
             self._hidden_opp.add(move)
             self._collision_count += 1
+            self._dark_risk[move] += 4.0
+            for nr, nc in _neighbors_of(self._size, move[0], move[1]):
+                self._dark_risk[(nr, nc)] += 1.25
 
     def play(self, board, last_move):
         t0 = time.monotonic()
@@ -619,74 +954,107 @@ class MiEstrategiaGR5(Strategy):
 
         self._move_count += 1
         budget = min(0.97, TIME_BUDGET + 0.06 / (1.0 + self._move_count * 0.25))
-        duration = min(tl * budget, tl - SAFETY_TAIL)
+        safety_tail = SAFETY_TAIL_CLASSIC if self._variant == "classic" else SAFETY_TAIL_DARK
+        duration = min(tl * budget, tl - safety_tail)
         deadline = t0 + duration
+        apparent_board = board
+        apparent_empties = _collect_empty_cells(apparent_board, size)
 
         if OPENING_BOOK and self._variant == "classic":
-            ob_move = self._opening_book_move(board, last_move)
+            ob_move = self._opening_book_move(apparent_board, last_move)
             if ob_move is not None:
-                self._reset_tree(ob_move, board)
+                self._reset_tree(ob_move, apparent_board)
                 return ob_move
 
         determinizations = None
         if self._variant == "dark":
-            determinizations = [self._determinize(board) for _ in range(NUM_DETERMINIZATIONS)]
+            dark_open = self._dark_opening_move(apparent_board)
+            if dark_open is not None:
+                self._reset_tree(dark_open, apparent_board)
+                return dark_open
+
+        if len(apparent_empties) == 1:
+            self._reset_tree(apparent_empties[0], apparent_board)
+            return apparent_empties[0]
+
+        if self._variant == "dark":
+            fallback = _dark_safe_fallback(
+                apparent_board,
+                size,
+                self._player,
+                apparent_empties,
+                self._dark_risk,
+                self._hidden_opp,
+            )
+            prep_budget = min(DARK_PREP_CAP, duration * DARK_PREP_FRACTION)
+            prep_deadline = min(deadline - DARK_WORKER_MARGIN, t0 + prep_budget)
+            determinizations = [self._determinize(apparent_board)]
+            while len(determinizations) < self._num_determinizations and time.monotonic() < prep_deadline:
+                determinizations.append(self._determinize(apparent_board))
             board = determinizations[0]
             self._root = None
-
-        empties = empty_cells(board, size)
-        fallback = _greedy_fallback(board, size, self._player, empties)
-        if len(empties) == 1:
-            self._reset_tree(empties[0], board)
-            return empties[0]
+            empties = _collect_empty_cells(board, size)
+        else:
+            empties = apparent_empties
+            fallback = _greedy_fallback(apparent_board, size, self._player, empties)
 
         # Victoria inmediata
+        probe_board = _board_to_lists(board)
         for m in empties:
             if time.monotonic() >= deadline:
                 self._reset_tree(fallback, board)
                 return fallback
-            brd = _board_to_lists(board)
-            brd[m[0]][m[1]] = self._player
-            if check_winner(brd, size) == self._player:
+            probe_board[m[0]][m[1]] = self._player
+            if _check_winner(probe_board, size) == self._player:
+                probe_board[m[0]][m[1]] = 0
                 self._reset_tree(m, board)
                 return m
+            probe_board[m[0]][m[1]] = 0
 
         # Bloqueo de victoria del oponente
         for m in empties:
             if time.monotonic() >= deadline:
                 self._reset_tree(fallback, board)
                 return fallback
-            brd = _board_to_lists(board)
-            brd[m[0]][m[1]] = self._opponent
-            if check_winner(brd, size) == self._opponent:
+            probe_board[m[0]][m[1]] = self._opponent
+            if _check_winner(probe_board, size) == self._opponent:
+                probe_board[m[0]][m[1]] = 0
                 self._reset_tree(m, board)
                 return m
+            probe_board[m[0]][m[1]] = 0
 
         # Enviar workers paralelos
         board_tuple = (board if isinstance(board[0], tuple)
                        else tuple(tuple(r) for r in board))
-        worker_duration = max(0.1, duration - 0.15)
+        worker_margin = CLASSIC_WORKER_MARGIN if self._variant == "classic" else DARK_WORKER_MARGIN
+        remaining_window = deadline - time.monotonic()
+        worker_duration = max(0.1, remaining_window - worker_margin)
         async_result = None
         use_edge_templates = (self._variant == "classic")
-        if self._pool is not None:
+        allow_workers = (
+            self._pool is not None
+            and self._pool_workers > 0
+            and (self._variant == "classic" or remaining_window >= DARK_MIN_SEARCH_WINDOW)
+        )
+        if allow_workers:
             try:
                 if self._variant == "dark" and determinizations is not None:
                     args_list = [
-                        (determinizations[i % NUM_DETERMINIZATIONS], size,
+                        (determinizations[i % len(determinizations)], size,
                          self._player, worker_duration, random.randint(0, 2**31),
                          False)
-                        for i in range(NUM_WORKERS)
+                        for i in range(self._pool_workers)
                     ]
                 else:
                     args_list = [
                         (board_tuple, size, self._player,
                          worker_duration, random.randint(0, 2**31),
                          use_edge_templates)
-                        for _ in range(NUM_WORKERS)
+                        for _ in range(self._pool_workers)
                     ]
                 async_result = self._pool.map_async(_worker_run, args_list)
             except Exception:
-                self._pool = None
+                self._dispose_pool()
                 async_result = None
 
         # MCTS en proceso principal (con tree reuse y tabla de transposicion)
@@ -723,7 +1091,7 @@ class MiEstrategiaGR5(Strategy):
                     for move, v in worker_votes.items():
                         vote_counts[move] += v
             except Exception:
-                self._pool = None
+                self._dispose_pool()
 
         if not vote_counts:
             self._reset_tree(fallback, board)
@@ -739,7 +1107,12 @@ class MiEstrategiaGR5(Strategy):
                     if det[r][c] == 0:
                         empty_count += 1
                 p_empty[cand] = max(1.0 / total, empty_count / total)
-            best = max(vote_counts, key=lambda move: vote_counts[move] * p_empty.get(move, 1.0))
+            best = max(
+                vote_counts,
+                key=lambda move: vote_counts[move]
+                * p_empty.get(move, 1.0)
+                * _dark_risk_clearance(move, size, self._dark_risk, self._hidden_opp),
+            )
         else:
             best = max(vote_counts, key=vote_counts.get)
         self._root = root
@@ -754,13 +1127,50 @@ class MiEstrategiaGR5(Strategy):
         size = self._size
         if size != 11:
             return None
-        empties = empty_cells(board, size)
+        empties = _collect_empty_cells(board, size)
         if len(empties) < size * size - 2:
             return None
         if self._player == 2 and last_move is not None and len(empties) == size * size - 1:
             move = _OPENING_BOOK.get((last_move,))
             if move and board[move[0]][move[1]] == 0:
                 return move
+        return None
+
+    def _dark_opening_move(self, board):
+        if self._size != 11:
+            return None
+        if self._hidden_opp:
+            return None
+
+        if self._player == 2 and self._move_count == 1:
+            return _pick_opening_move(
+                _DARK_WHITE_OPENING,
+                board,
+                self._size,
+                self._dark_risk,
+                self._hidden_opp,
+            )
+
+        if self._player == 1 and self._move_count == 1:
+            return _pick_opening_move(
+                _DARK_BLACK_OPENING,
+                board,
+                self._size,
+                self._dark_risk,
+                self._hidden_opp,
+            )
+
+        if self._player == 1 and self._move_count == 2 and len(self._my_moves) == 1:
+            first = next(iter(self._my_moves))
+            reply_candidates = _DARK_BLACK_REPLY.get(first)
+            if reply_candidates:
+                return _pick_opening_move(
+                    reply_candidates,
+                    board,
+                    self._size,
+                    self._dark_risk,
+                    self._hidden_opp,
+                )
         return None
 
     # ------------------------------------------------------------------
@@ -816,15 +1226,15 @@ class MiEstrategiaGR5(Strategy):
             0,
             (my_count + self._collision_count) - known_count - offset
         )
-        current_empties = [(r, c) for r in range(size) for c in range(size) if b[r][c] == 0]
+        current_empties = _collect_empty_cells(b, size)
         estimated_hidden = min(estimated_hidden, len(current_empties))
 
         available = [(r, c) for r, c in current_empties if (r, c) not in self._failed_moves]
         center = size / 2
         known_list = list(known_opp)
-
-        def weight(rc):
-            r, c = rc
+        weights = []
+        total_w = 0.0
+        for r, c in available:
             dist_center = abs(r - center) + abs(c - center)
             w_center = max(1, size - dist_center)
             if self._opponent == 1:
@@ -836,25 +1246,30 @@ class MiEstrategiaGR5(Strategy):
                 w_cluster = max(1, size - min_d)
             else:
                 w_cluster = 1
-            return 0.35 * w_center + 0.30 * w_edge + 0.35 * w_cluster
+            risk_bias = 1.0 + min(3.0, self._dark_risk.get((r, c), 0.0)) * 0.20
+            weight = (0.35 * w_center + 0.30 * w_edge + 0.35 * w_cluster) * risk_bias
+            weights.append(weight)
+            total_w += weight
 
         n_place = min(estimated_hidden, len(available))
-        if n_place > 0:
+        if n_place > 0 and available:
             avail_copy = list(available)
+            weight_copy = list(weights)
             for _ in range(n_place):
-                if not avail_copy:
+                if not avail_copy or total_w <= 0.0:
                     break
-                total_w = sum(weight(rc) for rc in avail_copy)
                 r_val = random.random() * total_w
                 cumul = 0.0
                 idx = len(avail_copy) - 1
-                for i, rc in enumerate(avail_copy):
-                    cumul += weight(rc)
+                for i, weight in enumerate(weight_copy):
+                    cumul += weight
                     if r_val <= cumul:
                         idx = i
                         break
                 r, c = avail_copy[idx]
                 b[r][c] = self._opponent
+                total_w -= weight_copy[idx]
                 avail_copy.pop(idx)
+                weight_copy.pop(idx)
 
         return tuple(tuple(row) for row in b)
